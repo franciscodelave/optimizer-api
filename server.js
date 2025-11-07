@@ -7,6 +7,9 @@ const cors = require('cors');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// Taille max en sortie : 9 MB
+const MAX_OUTPUT_SIZE = 9 * 1024 * 1024;
+
 // Configuration CORS
 app.use(cors());
 app.use(express.json());
@@ -19,7 +22,6 @@ const upload = multer({
     fileSize: 500 * 1024 * 1024 // Limite de 500MB
   },
   fileFilter: (req, file, cb) => {
-    // Vérifier le type de fichier
     if (file.mimetype.startsWith('image/')) {
       cb(null, true);
     } else {
@@ -28,35 +30,16 @@ const upload = multer({
   }
 });
 
-// Route de santé
-app.get('/', (req, res) => {
-  res.json({
-    status: 'ok',
-    message: 'API d\'optimisation d\'images est active',
-    endpoints: {
-      optimize: 'POST /optimize - Optimiser une image',
-      resize: 'POST /resize - Redimensionner et optimiser une image',
-      convert: 'POST /convert - Convertir le format d\'une image'
-    }
-  });
-});
+// Fonction pour compresser jusqu'à atteindre 9 MB max
+async function compressToMaxSize(buffer, format = 'webp', targetSize = MAX_OUTPUT_SIZE) {
+  let quality = 95;
+  let compressedBuffer;
+  let attempts = 0;
+  const maxAttempts = 10;
 
-// Route pour optimiser une image
-app.post('/optimize', upload.single('image'), async (req, res) => {
-  try {
-    if (!req.file) {
-      return res.status(400).json({ error: 'Aucune image fournie' });
-    }
+  while (attempts < maxAttempts) {
+    let sharpInstance = sharp(buffer, { limitInputPixels: false });
 
-    const quality = parseInt(req.body.quality) || 80;
-    const format = req.body.format || 'webp';
-
-    // Optimiser l'image - AVEC limitInputPixels: false
-    let sharpInstance = sharp(req.file.buffer, {
-      limitInputPixels: false
-    });
-    
-    // Convertir et compresser selon le format
     switch (format.toLowerCase()) {
       case 'jpeg':
       case 'jpg':
@@ -79,26 +62,113 @@ app.post('/optimize', upload.single('image'), async (req, res) => {
         sharpInstance = sharpInstance.webp({ quality });
     }
 
-    const optimizedBuffer = await sharpInstance.toBuffer();
-    
-    // Calculer la réduction de taille
+    compressedBuffer = await sharpInstance.toBuffer();
+
+    // Si la taille est OK, on retourne
+    if (compressedBuffer.length <= targetSize) {
+      return {
+        buffer: compressedBuffer,
+        quality: quality,
+        finalSize: compressedBuffer.length
+      };
+    }
+
+    // Sinon on réduit la qualité
+    quality -= 10;
+    attempts++;
+
+    // Si on atteint une qualité trop basse, on redimensionne
+    if (quality < 30) {
+      const metadata = await sharp(buffer, { limitInputPixels: false }).metadata();
+      const scaleFactor = Math.sqrt(targetSize / compressedBuffer.length);
+      const newWidth = Math.floor(metadata.width * scaleFactor);
+      
+      sharpInstance = sharp(buffer, { limitInputPixels: false })
+        .resize({ width: newWidth, withoutEnlargement: false });
+
+      switch (format.toLowerCase()) {
+        case 'jpeg':
+        case 'jpg':
+          sharpInstance = sharpInstance.jpeg({ quality: 75, mozjpeg: true });
+          break;
+        case 'png':
+          sharpInstance = sharpInstance.png({ quality: 75, compressionLevel: 9 });
+          break;
+        case 'webp':
+          sharpInstance = sharpInstance.webp({ quality: 75 });
+          break;
+        case 'avif':
+          sharpInstance = sharpInstance.avif({ quality: 75 });
+          break;
+        default:
+          sharpInstance = sharpInstance.webp({ quality: 75 });
+      }
+
+      compressedBuffer = await sharpInstance.toBuffer();
+      
+      return {
+        buffer: compressedBuffer,
+        quality: 75,
+        finalSize: compressedBuffer.length,
+        resized: true
+      };
+    }
+  }
+
+  return {
+    buffer: compressedBuffer,
+    quality: quality,
+    finalSize: compressedBuffer.length
+  };
+}
+
+// Route de santé
+app.get('/', (req, res) => {
+  res.json({
+    status: 'ok',
+    message: 'API d\'optimisation d\'images est active (Max 9 MB en sortie)',
+    maxOutputSize: '9 MB',
+    endpoints: {
+      optimize: 'POST /optimize - Optimiser une image',
+      resize: 'POST /resize - Redimensionner et optimiser une image',
+      convert: 'POST /convert - Convertir le format d\'une image'
+    }
+  });
+});
+
+// Route pour optimiser une image (MAX 9 MB)
+app.post('/optimize', upload.single('image'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'Aucune image fournie' });
+    }
+
+    const format = req.body.format || 'webp';
     const originalSize = req.file.buffer.length;
-    const optimizedSize = optimizedBuffer.length;
-    const reduction = ((originalSize - optimizedSize) / originalSize * 100).toFixed(2);
+
+    // Compression automatique jusqu'à 9 MB max
+    const result = await compressToMaxSize(req.file.buffer, format);
+    
+    const reduction = ((originalSize - result.finalSize) / originalSize * 100).toFixed(2);
 
     res.set('Content-Type', `image/${format}`);
     res.set('X-Original-Size', originalSize);
-    res.set('X-Optimized-Size', optimizedSize);
+    res.set('X-Optimized-Size', result.finalSize);
     res.set('X-Size-Reduction', `${reduction}%`);
+    res.set('X-Quality-Used', result.quality);
+    if (result.resized) {
+      res.set('X-Was-Resized', 'true');
+    }
     
-    res.send(optimizedBuffer);
+    // ✅ ON RETOURNE UNIQUEMENT L'IMAGE OPTIMISÉE
+    res.send(result.buffer);
   } catch (error) {
     console.error('Erreur lors de l\'optimisation:', error);
     res.status(500).json({ error: 'Erreur lors de l\'optimisation de l\'image' });
   }
 });
 
-// Route pour redimensionner et optimiser une image
+// Route pour redimensionner et optimiser une image (MAX 9 MB)
 app.post('/resize', upload.single('image'), async (req, res) => {
   try {
     if (!req.file) {
@@ -107,14 +177,10 @@ app.post('/resize', upload.single('image'), async (req, res) => {
 
     const width = parseInt(req.body.width);
     const height = parseInt(req.body.height);
-    const quality = parseInt(req.body.quality) || 80;
     const format = req.body.format || 'webp';
-    const fit = req.body.fit || 'cover'; // cover, contain, fill, inside, outside
+    const fit = req.body.fit || 'cover';
 
-    // AVEC limitInputPixels: false
-    let sharpInstance = sharp(req.file.buffer, {
-      limitInputPixels: false
-    });
+    let sharpInstance = sharp(req.file.buffer, { limitInputPixels: false });
 
     // Redimensionner si les dimensions sont fournies
     if (width || height) {
@@ -126,44 +192,32 @@ app.post('/resize', upload.single('image'), async (req, res) => {
       });
     }
 
-    // Appliquer le format et la compression
-    switch (format.toLowerCase()) {
-      case 'jpeg':
-      case 'jpg':
-        sharpInstance = sharpInstance.jpeg({ quality, mozjpeg: true });
-        break;
-      case 'png':
-        sharpInstance = sharpInstance.png({ quality, compressionLevel: 9 });
-        break;
-      case 'webp':
-        sharpInstance = sharpInstance.webp({ quality });
-        break;
-      case 'avif':
-        sharpInstance = sharpInstance.avif({ quality });
-        break;
-      default:
-        sharpInstance = sharpInstance.webp({ quality });
-    }
-
-    const optimizedBuffer = await sharpInstance.toBuffer();
-    
+    const resizedBuffer = await sharpInstance.toBuffer();
     const originalSize = req.file.buffer.length;
-    const optimizedSize = optimizedBuffer.length;
-    const reduction = ((originalSize - optimizedSize) / originalSize * 100).toFixed(2);
+
+    // Compression automatique jusqu'à 9 MB max
+    const result = await compressToMaxSize(resizedBuffer, format);
+    
+    const reduction = ((originalSize - result.finalSize) / originalSize * 100).toFixed(2);
 
     res.set('Content-Type', `image/${format}`);
     res.set('X-Original-Size', originalSize);
-    res.set('X-Optimized-Size', optimizedSize);
+    res.set('X-Optimized-Size', result.finalSize);
     res.set('X-Size-Reduction', `${reduction}%`);
+    res.set('X-Quality-Used', result.quality);
+    if (result.resized) {
+      res.set('X-Was-Resized', 'true');
+    }
     
-    res.send(optimizedBuffer);
+    // ✅ ON RETOURNE UNIQUEMENT L'IMAGE OPTIMISÉE
+    res.send(result.buffer);
   } catch (error) {
     console.error('Erreur lors du redimensionnement:', error);
     res.status(500).json({ error: 'Erreur lors du redimensionnement de l\'image' });
   }
 });
 
-// Route pour convertir le format d'une image
+// Route pour convertir le format d'une image (MAX 9 MB)
 app.post('/convert', upload.single('image'), async (req, res) => {
   try {
     if (!req.file) {
@@ -171,35 +225,21 @@ app.post('/convert', upload.single('image'), async (req, res) => {
     }
 
     const format = req.body.format || 'webp';
-    const quality = parseInt(req.body.quality) || 80;
+    const originalSize = req.file.buffer.length;
 
-    // AVEC limitInputPixels: false
-    let sharpInstance = sharp(req.file.buffer, {
-      limitInputPixels: false
-    });
-
-    switch (format.toLowerCase()) {
-      case 'jpeg':
-      case 'jpg':
-        sharpInstance = sharpInstance.jpeg({ quality, mozjpeg: true });
-        break;
-      case 'png':
-        sharpInstance = sharpInstance.png({ quality, compressionLevel: 9 });
-        break;
-      case 'webp':
-        sharpInstance = sharpInstance.webp({ quality });
-        break;
-      case 'avif':
-        sharpInstance = sharpInstance.avif({ quality });
-        break;
-      default:
-        return res.status(400).json({ error: 'Format non supporté' });
-    }
-
-    const convertedBuffer = await sharpInstance.toBuffer();
+    // Compression automatique jusqu'à 9 MB max
+    const result = await compressToMaxSize(req.file.buffer, format);
     
     res.set('Content-Type', `image/${format}`);
-    res.send(convertedBuffer);
+    res.set('X-Original-Size', originalSize);
+    res.set('X-Optimized-Size', result.finalSize);
+    res.set('X-Quality-Used', result.quality);
+    if (result.resized) {
+      res.set('X-Was-Resized', 'true');
+    }
+    
+    // ✅ ON RETOURNE UNIQUEMENT L'IMAGE OPTIMISÉE
+    res.send(result.buffer);
   } catch (error) {
     console.error('Erreur lors de la conversion:', error);
     res.status(500).json({ error: 'Erreur lors de la conversion de l\'image' });
@@ -219,4 +259,5 @@ app.use((error, req, res, next) => {
 app.listen(PORT, () => {
   console.log(`🚀 Serveur démarré sur le port ${PORT}`);
   console.log(`📍 URL: http://localhost:${PORT}`);
+  console.log(`📦 Taille max en sortie: 9 MB`);
 });
