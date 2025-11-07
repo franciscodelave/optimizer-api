@@ -51,8 +51,10 @@ app.post('/optimize', upload.single('image'), async (req, res) => {
     const quality = parseInt(req.body.quality) || 80;
     const format = req.body.format || 'webp';
 
-    // Optimiser l'image
-    let sharpInstance = sharp(req.file.buffer);
+    // Optimiser l'image - AVEC limitInputPixels: false
+    let sharpInstance = sharp(req.file.buffer, {
+      limitInputPixels: false
+    });
     
     // Convertir et compresser selon le format
     switch (format.toLowerCase()) {
@@ -109,7 +111,10 @@ app.post('/resize', upload.single('image'), async (req, res) => {
     const format = req.body.format || 'webp';
     const fit = req.body.fit || 'cover'; // cover, contain, fill, inside, outside
 
-    let sharpInstance = sharp(req.file.buffer);
+    // AVEC limitInputPixels: false
+    let sharpInstance = sharp(req.file.buffer, {
+      limitInputPixels: false
+    });
 
     // Redimensionner si les dimensions sont fournies
     if (width || height) {
@@ -168,7 +173,10 @@ app.post('/convert', upload.single('image'), async (req, res) => {
     const format = req.body.format || 'webp';
     const quality = parseInt(req.body.quality) || 80;
 
-    let sharpInstance = sharp(req.file.buffer);
+    // AVEC limitInputPixels: false
+    let sharpInstance = sharp(req.file.buffer, {
+      limitInputPixels: false
+    });
 
     switch (format.toLowerCase()) {
       case 'jpeg':
@@ -202,7 +210,7 @@ app.post('/convert', upload.single('image'), async (req, res) => {
 app.use((error, req, res, next) => {
   if (error instanceof multer.MulterError) {
     if (error.code === 'LIMIT_FILE_SIZE') {
-      return res.status(400).json({ error: 'Le fichier est trop volumineux (max 10MB)' });
+      return res.status(400).json({ error: 'Le fichier est trop volumineux (max 500MB)' });
     }
   }
   res.status(500).json({ error: error.message });
